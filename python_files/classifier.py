@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from collections import OrderedDict
+
+import torch
+import torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+
+
+class ResNet50(nn.Module):
+    def __init__(self, n_classes=1000, pretrained=True, hidden_size=2048, model_file='/n/fs/nmdz-gender/resnet50_places365.pth.tar'):
+        super().__init__()
+        self.resnet = torchvision.models.resnet50(pretrained=pretrained)
+        if not pretrained:
+            self.resnet = torch.hub.load('yukimasano/PASS:main', 'moco_resnet50')
+            # self.resnet.fc = nn.Linear(hidden_size, 365)
+            # checkpoint = torch.load(model_file, map_location=lambda storage, loc: storage)
+            # state_dict = {str.replace(k,'module.',''): v for k,v in checkpoint['state_dict'].items()}
+            # self.resnet.load_state_dict(state_dict)
+        self.resnet.fc = nn.Linear(hidden_size, n_classes)
+
+
+    def require_all_grads(self):
+        for name, param in self.resnet.named_parameters():
+            print(name)
+            param.requires_grad = True
+
+    def forward(self, x):
+        outputs = self.resnet(x)
+        return outputs
+
+class multilabel_classifier():
+
+    def __init__(self, device, dtype, model_file, nclasses=1, modelpath=None, hidden_size=2048, learning_rate=0.1, weight_decay=1e-4):
+        self.nclasses = nclasses
+        self.hidden_size = hidden_size
+        self.device = device
+        self.dtype = dtype
+
+        self.model = ResNet50(n_classes=nclasses, hidden_size=hidden_size, pretrained=True)
+        self.model.require_all_grads()
+
+        # Multi-GPU training
+        if torch.cuda.device_count() > 1:
+            self.model = nn.DataParallel(self.model)
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
+
+        self.epoch = 1
+        self.print_freq = 100
+
+        if modelpath != None:
+            A = torch.load(modelpath, map_location=device)
+            load_state_dict = A['model']
+            load_prefix = list(load_state_dict.keys())[0][:6]
+            new_state_dict = {}
+            for key in load_state_dict:
+                value = load_state_dict[key]
+                # Multi-GPU state dict has the prefix 'module.' appended in front of each key
+                if torch.cuda.device_count() > 1:
+                    if load_prefix != 'module':
+                        new_key = 'module.' + key
+                        new_state_dict[new_key] = value
+                    else:
+                        new_state_dict[key] = value
+                else:
+                    if load_prefix == 'module':
+                        new_key = key[7:]
+                        new_state_dict[new_key] = value
+                    else:
+                        new_state_dict[key] = value
+            self.model.load_state_dict(new_state_dict)
+            self.epoch = A['epoch']
+
+    def forward(self, x):
+        outputs = self.model(x)
+        return outputs
+
+    def save_model(self, path):
+        torch.save({'model':self.model.state_dict(), 'optim':self.optimizer, 'epoch':self.epoch}, path)
+
+    def train(self, loader):
+        """Train the 'standard baseline' model for one epoch"""
+
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
+        self.model.train()
+
+        loss_list = []
+        for i, (images, labels, ids) in enumerate(loader):
+            images = images.to(device=self.device, dtype=self.dtype)
+            labels = labels.to(device=self.device, dtype=self.dtype)
+            #print(labels, flush = True)
+            #print(labels.dtype, flush = True)
+
+            self.optimizer.zero_grad()
+            outputs = self.forward(images)
+            #print(outputs, flush = True)
+            # There are 9.2x more light skin images than dark skin
+            pos_weight = torch.tensor([9.2]).to(self.device)
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight = pos_weight)
+            loss = criterion(outputs.squeeze(), labels)
+            loss.backward()
+            self.optimizer.step()
+
+            loss_list.append(loss.item())
+            if self.print_freq and (i % self.print_freq == 0):
+                print('Training epoch {} [{}|{}] loss: {}'.format(self.epoch, i+1, len(loader), loss.item()), flush=True)
+
+        self.epoch += 1
+        return loss_list
+
+    def test(self, loader):
+        """Evaluate the 'standard baseline' model"""
+
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
+        self.model.eval()
+
+        with torch.no_grad():
+            files_list = []
+            labels_list = np.array([], dtype=np.float32).reshape(0, self.nclasses)
+            scores_list = np.array([], dtype=np.float32).reshape(0, self.nclasses)
+            loss_list = []
+
+            for i, (images, labels, ids) in enumerate(loader):
+                images = images.to(device=self.device, dtype=self.dtype)
+                # print(images.size())
+                # print(labels.size())
+                labels = labels.to(device=self.device, dtype=self.dtype)
+
+                # Center crop
+                outputs = self.forward(images)
+                
+                # print(outputs)
+                # print(labels)
+                # print(outputs.size())
+                # print(labels.size())
+
+                # Ten crop
+                # bs, ncrops, c, h, w = images.size()
+                # outputs = self.forward(images.view(-1, c, h, w)) # fuse batch size and ncrops
+                # outputs = outputs.view(bs, ncrops, -1).mean(1) # avg over crops
+                # There are 9.2x more light skin images than dark skin
+                pos_weight = torch.tensor([9.2]).to(self.device)
+                criterion = torch.nn.BCEWithLogitsLoss(pos_weight = pos_weight)
+                
+                # test set with faces masked has 1 remainder when divided by 64
+                # and a batch size of 1 causes issues with torch.squeeze()
+                loss = criterion(outputs.squeeze(dim = 1), labels)
+                loss_list.append(loss.item())
+                scores = torch.sigmoid(outputs).squeeze(dim = 1)
+                labels_list = np.concatenate((labels_list.squeeze(), labels.detach().cpu().numpy()), axis=0)
+                scores_list = np.concatenate((scores_list.squeeze(), scores.detach().cpu().numpy()), axis=0)
+                files_list.extend(ids)
+        return labels_list, scores_list, loss_list, files_list
