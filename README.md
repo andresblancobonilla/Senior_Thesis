@@ -1,5 +1,7 @@
 # Senior_Thesis
-My paper, extending previous work on gender bias (https://princetonvisualai.github.io/gender-artifacts/), investigates racial artifacts in the
+## Code for senior thesis "Racial Artifacts in the COCO Dataset"
+### Adapted from Meister and Zhao et al's work on gender artifacts (https://princetonvisualai.github.io/gender-artifacts/) and Wang et al.'s work on bias mitigation (https://github.com/princetonvisualai/DomainBiasMitigation)
+My paper, extending previous work on gender bias, investigates racial artifacts in the
 Common Objects in Context (COCO) dataset, which are visual cues in the images of
 the dataset that are correlated with race and learnable by a machine learning model.
 Using recently crowd-sourced Fitzpatrick skin type annotations on the dataset, I train
